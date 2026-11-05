@@ -46,6 +46,49 @@ int TMP_SIZE = 0;
 SDL_Window *vid_win = NULL;
 
 static int Mini_VideoInit(_THIS);
+
+/* Asynchronous flip (triple buffering).
+ * FBIOPAN_DISPLAY blocks until the next vblank (~16.7 ms measured on the Plus), so with the
+ * plain double buffer every frame that takes longer than one refresh waits for the following
+ * one: an app needing 17 ms per frame runs at 30 fps instead of ~59. With three pages a
+ * present thread does the pan while the app draws the next frame in the third page.
+ * At most one frame is queued, so apps faster than the panel are still paced by vblank.
+ * SDL_MINI_SYNC_FLIP=1, or video memory too small for 3 pages, keeps the original flip. */
+static int fb_pages = 2;
+static int draw_page = 0;     /* page GFX_Copy draws into */
+static int shown_page = 0;    /* page on screen (or being panned to) */
+static int queued_page = -1;  /* page waiting for the present thread, -1 none */
+static int flip_async = 0;
+static int flip_stop = 0;
+static pthread_t flip_thread;
+static pthread_mutex_t flip_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t flip_cond = PTHREAD_COND_INITIALIZER;
+
+static void *Mini_FlipThread(void *arg)
+{
+    struct fb_var_screeninfo v;
+
+    (void)arg;
+    pthread_mutex_lock(&flip_lock);
+    for (;;) {
+        while ((queued_page < 0) && !flip_stop) {
+            pthread_cond_wait(&flip_cond, &flip_lock);
+        }
+        if (queued_page < 0) {
+            break;
+        }
+        v = gfx.vinfo;
+        v.yoffset = queued_page * FB_H;
+        pthread_mutex_unlock(&flip_lock);
+        ioctl(gfx.fb_dev, FBIOPAN_DISPLAY, &v);
+        pthread_mutex_lock(&flip_lock);
+        shown_page = queued_page;
+        queued_page = -1;
+        pthread_cond_broadcast(&flip_cond);
+    }
+    pthread_mutex_unlock(&flip_lock);
+    return NULL;
+}
 static int Mini_SetDisplayMode(_THIS, SDL_VideoDisplay *display, SDL_DisplayMode *mode);
 static void Mini_VideoQuit(_THIS);
 
@@ -58,9 +101,22 @@ int Mini_InitGFX(void)
     gfx.fb_dev = open("/dev/fb0", O_RDWR);
     ioctl(gfx.fb_dev, FBIOGET_FSCREENINFO, &gfx.finfo);
     ioctl(gfx.fb_dev, FBIOGET_VSCREENINFO, &gfx.vinfo);
+    {
+        const char *e = getenv("SDL_MINI_SYNC_FLIP");
+        unsigned page = gfx.finfo.line_length * gfx.vinfo.yres;
+
+        fb_pages = 2;
+        if (!(e && (e[0] == '1')) && page && ((gfx.finfo.smem_len / page) >= 3)) {
+            fb_pages = 3;
+        }
+    }
     gfx.vinfo.yoffset = 0;
-    gfx.vinfo.yres_virtual = gfx.vinfo.yres * 2;
+    gfx.vinfo.yres_virtual = gfx.vinfo.yres * fb_pages;
     ioctl(gfx.fb_dev, FBIOPUT_VSCREENINFO, &gfx.vinfo);
+    FB_SIZE = FB_W * FB_H * FB_BPP * fb_pages;
+    draw_page = (fb_pages == 3) ? 1 : 0;
+    shown_page = 0;
+    queued_page = -1;
 
     gfx.fb.phyAddr = gfx.finfo.smem_start;
     MI_SYS_MemsetPa(gfx.fb.phyAddr, 0, FB_SIZE);
@@ -93,12 +149,30 @@ void GFX_Init(void)
 {
     debug("%s\n", __func__);
     Mini_InitGFX();
+    flip_async = 0;
+    if (fb_pages == 3) {
+        flip_stop = 0;
+        if (pthread_create(&flip_thread, NULL, Mini_FlipThread, NULL) == 0) {
+            flip_async = 1;
+        }
+        else {
+            draw_page = 1; /* sync flip on pages 0..2 still works, see GFX_Flip */
+        }
+    }
 }
 
 void GFX_Quit(void)
 {
     debug("%s\n", __func__);
 
+    if (flip_async) {
+        pthread_mutex_lock(&flip_lock);
+        flip_stop = 1;
+        pthread_cond_broadcast(&flip_cond);
+        pthread_mutex_unlock(&flip_lock);
+        pthread_join(flip_thread, NULL);
+        flip_async = 0;
+    }
     GFX_Clear();
     Mini_QuitGFX();
     gfx.vinfo.yoffset = 0;
@@ -146,7 +220,7 @@ int GFX_Copy(const void *pixels, SDL_Rect srt, SDL_Rect drt, int pitch, int alph
     gfx.hw.dst.surf.u32Height = FB_H;
     gfx.hw.dst.surf.u32Stride = FB_W * FB_BPP;
     gfx.hw.dst.surf.eColorFmt = E_MI_GFX_FMT_ARGB8888;
-    gfx.hw.dst.surf.phyAddr = gfx.fb.phyAddr + (FB_W * gfx.vinfo.yoffset * FB_BPP);
+    gfx.hw.dst.surf.phyAddr = gfx.fb.phyAddr + (FB_W * FB_H * draw_page * FB_BPP);
 
     MI_SYS_FlushInvCache(gfx.tmp.virAddr, pitch * srt.h);
     MI_GFX_BitBlit(&gfx.hw.src.surf, &gfx.hw.src.rt, &gfx.hw.dst.surf, &gfx.hw.dst.rt, &gfx.hw.opt, &u16Fence);
@@ -157,8 +231,21 @@ int GFX_Copy(const void *pixels, SDL_Rect srt, SDL_Rect drt, int pitch, int alph
 void GFX_Flip(void)
 {
     debug("%s\n", __func__);
+    if (flip_async) {
+        pthread_mutex_lock(&flip_lock);
+        while (queued_page >= 0) {
+            pthread_cond_wait(&flip_cond, &flip_lock);
+        }
+        queued_page = draw_page;
+        draw_page = 3 - shown_page - queued_page; /* the page neither shown nor queued */
+        pthread_cond_broadcast(&flip_cond);
+        pthread_mutex_unlock(&flip_lock);
+        return;
+    }
+    gfx.vinfo.yoffset = draw_page * FB_H;
     ioctl(gfx.fb_dev, FBIOPAN_DISPLAY, &gfx.vinfo);
-    gfx.vinfo.yoffset ^= FB_H;
+    shown_page = draw_page;
+    draw_page = (draw_page + 1) % fb_pages;
 }
 
 void* GFX_CB(void)
