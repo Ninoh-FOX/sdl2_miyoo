@@ -210,8 +210,29 @@ static void MINI_PlayDevice(_THIS)
     aoTestFrame.u32Len = this->hidden->mixlen;
     aoTestFrame.apVirAddr[0] = this->hidden->mixbuf;
     aoTestFrame.apVirAddr[1] = NULL;
-    MI_AO_SendFrame(AoDevId, AoChn, &aoTestFrame, 1);
-    usleep(((stSetAttr.u32PtNumPerFrm * 1000) / stSetAttr.eSamplerate - 10) * 1000);
+
+    /* Wait until the chip queue is below ~4 buffers before sending. The old
+       fixed usleep() worked out to 0 ms for 512 samples at 48 kHz, so this
+       thread spun, filled the whole 64 KiB channel (~300 ms of lag) and lost
+       buffers when SendFrame timed out on a full channel. */
+    {
+        MI_AO_ChnState_t st;
+        const MI_U32 target = (MI_U32)this->hidden->mixlen * 4;
+        int tries;
+
+        for (tries = 0; tries < 50; tries++) {
+            if (MI_AO_QueryChnStat(AoDevId, AoChn, &st) != MI_SUCCESS)
+                break;
+            if (st.u32ChnBusyNum + aoTestFrame.u32Len <= target)
+                break;
+            usleep(2000);
+        }
+        for (tries = 0; tries < 20; tries++) {
+            if (MI_AO_SendFrame(AoDevId, AoChn, &aoTestFrame, 0) == MI_SUCCESS)
+                break;
+            usleep(1000);
+        }
+    }
 }
 
 static uint8_t *MINI_GetDeviceBuf(_THIS)
