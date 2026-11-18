@@ -36,8 +36,8 @@
  *    the action buttons (everything except the d-pad) that start within the
  *    same window reach the application in the same pump, so buttons pressed
  *    "at the same time" land in the same frame even if the fingers are a
- *    few ms apart. The d-pad is not delayed. Off by default inside
- *    RetroArch, which already does this in its own joypad driver.
+ *    few ms apart. The d-pad is not delayed. A program with its own combo
+ *    buffer sets SDL_MINI_COMBO_MS=0 before SDL_Init (RetroArch does).
  *  - Minimum hold (SDL_MINI_MIN_HOLD_MS, 30 ms by default, 0 = off): a
  *    release is not delivered until the press has been visible for that
  *    long, so applications that read SDL_GetKeyboardState() once per frame
@@ -82,37 +82,6 @@ static Uint32 Mini_EnvMs(const char *name, Uint32 def)
         return (n < 0) ? 0 : (n > 1000 ? 1000 : (Uint32)n);
     }
     return def;
-}
-
-// RetroArch has its own combo buffer in its Miyoo Mini joypad driver, so the
-// SDL one would only add latency on top of it. Look at our own process name
-// (comm, or the command line if comm was changed) instead of pgrep, so other
-// programs are not affected while RetroArch runs in the background.
-static int Mini_IsRetroArch(void)
-{
-    char buf[256] = { 0 };
-    const char *files[] = { "/proc/self/comm", "/proc/self/cmdline" };
-    int c0 = 0;
-
-    for (c0 = 0; c0 < 2; c0++) {
-        int fd = open(files[c0], O_RDONLY);
-        ssize_t len = 0;
-
-        if (fd < 0) {
-            continue;
-        }
-        len = read(fd, buf, sizeof(buf) - 1);
-        close(fd);
-        if (len <= 0) {
-            continue;
-        }
-        buf[len] = 0;   // cmdline: only argv[0] (ends at the first NUL)
-        SDL_strlwr(buf);
-        if (SDL_strstr(buf, "retroarch")) {
-            return 1;
-        }
-    }
-    return 0;
 }
 
 static int Mini_IsDpad(int code)
@@ -286,8 +255,7 @@ void Mini_EventInit(void)
     mymap[KEY_RIGHTALT] = SDLK_RALT;
     mymap[KEY_LEFTALT] = SDLK_LALT;
 
-    // An explicit SDL_MINI_COMBO_MS always wins; otherwise no window for RetroArch
-    combo_ms = Mini_EnvMs("SDL_MINI_COMBO_MS", Mini_IsRetroArch() ? 0 : MINI_DEF_COMBO_MS);
+    combo_ms = Mini_EnvMs("SDL_MINI_COMBO_MS", MINI_DEF_COMBO_MS);
     hold_ms = Mini_EnvMs("SDL_MINI_MIN_HOLD_MS", MINI_DEF_HOLD_MS);
     debug("%s, combo window %u ms, minimum hold %u ms\n", __func__, combo_ms, hold_ms);
 
