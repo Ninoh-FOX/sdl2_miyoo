@@ -36,8 +36,9 @@
  *    the action buttons (everything except the d-pad) that start within the
  *    same window reach the application in the same pump, so buttons pressed
  *    "at the same time" land in the same frame even if the fingers are a
- *    few ms apart. The d-pad is not delayed. A program with its own combo
- *    buffer sets SDL_MINI_COMBO_MS=0 before SDL_Init (RetroArch does).
+ *    few ms apart. The d-pad is not delayed. The window can also be changed
+ *    while running with SDL_SetHint("SDL_MINI_COMBO_MS", ...): RetroArch sets
+ *    it from its "Joypad sensitivity" (0, half or the whole window).
  *  - Minimum hold (SDL_MINI_MIN_HOLD_MS, 30 ms by default, 0 = off): a
  *    release is not delivered until the press has been visible for that
  *    long, so applications that read SDL_GetKeyboardState() once per frame
@@ -68,20 +69,31 @@ static Uint8 sentkey[KEY_MAX] = { 0 };      // state sent to SDL (main thread)
 static Uint32 presstime[KEY_MAX] = { 0 };   // when the press was sent to SDL
 static SDL_Scancode mymap[KEY_MAX] = { 0 };
 
-static Uint32 combo_ms = MINI_DEF_COMBO_MS;
+static volatile Uint32 combo_ms = MINI_DEF_COMBO_MS;
 static Uint32 hold_ms = MINI_DEF_HOLD_MS;
 static int combo_active = 0;
 static Uint32 combo_start = 0;
 
-static Uint32 Mini_EnvMs(const char *name, Uint32 def)
+static Uint32 Mini_ParseMs(const char *v, Uint32 def)
 {
-    const char *v = SDL_getenv(name);
-
     if (v && *v) {
         int n = SDL_atoi(v);
         return (n < 0) ? 0 : (n > 1000 ? 1000 : (Uint32)n);
     }
     return def;
+}
+
+static Uint32 Mini_EnvMs(const char *name, Uint32 def)
+{
+    return Mini_ParseMs(SDL_getenv(name), def);
+}
+
+// SDL_MINI_COMBO_MS as an SDL hint (the environment variable is its default):
+// called at once with the current value and again whenever a program changes it
+static void SDLCALL Mini_ComboHintChanged(void *userdata, const char *name, const char *oldValue, const char *hint)
+{
+    combo_ms = Mini_ParseMs(hint, MINI_DEF_COMBO_MS);
+    debug("%s, combo window %u ms\n", __func__, combo_ms);
 }
 
 static int Mini_IsDpad(int code)
@@ -255,7 +267,7 @@ void Mini_EventInit(void)
     mymap[KEY_RIGHTALT] = SDLK_RALT;
     mymap[KEY_LEFTALT] = SDLK_LALT;
 
-    combo_ms = Mini_EnvMs("SDL_MINI_COMBO_MS", MINI_DEF_COMBO_MS);
+    SDL_AddHintCallback("SDL_MINI_COMBO_MS", Mini_ComboHintChanged, NULL);
     hold_ms = Mini_EnvMs("SDL_MINI_MIN_HOLD_MS", MINI_DEF_HOLD_MS);
     debug("%s, combo window %u ms, minimum hold %u ms\n", __func__, combo_ms, hold_ms);
 
@@ -280,6 +292,7 @@ void Mini_EventInit(void)
 void Mini_EventQuit(void)
 {
     debug("%s\n", __func__);
+    SDL_DelHintCallback("SDL_MINI_COMBO_MS", Mini_ComboHintChanged, NULL);
     running = 0;
     if (thread) {
         SDL_WaitThread(thread, NULL);
